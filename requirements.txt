@@ -1,5 +1,3 @@
-torch>=2.0.0
-torchaudio>=2.0.0
 diffusers>=0.24.0
 transformers>=4.35.0
 accelerate>=0.24.0
@@ -10,4 +8,4 @@ scipy>=1.10.0
 python-dotenv>=1.0.0
 runpod>=1.3.0
 boto3>=1.34.0
-botocore>=1.34.0
+# torch və torchaudio BURADA OLMAMALIDIR!
