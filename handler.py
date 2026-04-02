@@ -1,4 +1,4 @@
-# handler.py - DEBUG VERSION
+# handler.py - S3 ilə Supabase Storage versiyası
 import os
 import io
 import uuid
@@ -6,7 +6,8 @@ import runpod
 import torch
 import torchaudio
 from diffusers import AudioLDM2Pipeline
-from supabase import create_client, Client
+import boto3
+from botocore.config import Config
 import logging
 import sys
 import traceback
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure logging with more details
+# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -28,27 +29,34 @@ logger = logging.getLogger(__name__)
 
 # Log environment variables (without sensitive data)
 logger.info("=== ENVIRONMENT VARIABLES ===")
-logger.info(f"SUPABASE_URL: {os.getenv('SUPABASE_URL', 'NOT SET')}")
+logger.info(f"S3_ENDPOINT: {os.getenv('S3_ENDPOINT', 'NOT SET')}")
 logger.info(f"BUCKET_NAME: {os.getenv('BUCKET_NAME', 'NOT SET')}")
 logger.info(f"REGION_NAME: {os.getenv('REGION_NAME', 'NOT SET')}")
-logger.info(f"S3_ENDPOINT: {os.getenv('S3_ENDPOINT', 'NOT SET')}")
-logger.info("SUPABASE_KEY: SET" if os.getenv('SUPABASE_KEY') else "SUPABASE_KEY: NOT SET")
 logger.info("S3_ACCESS_KEY: SET" if os.getenv('S3_ACCESS_KEY') else "S3_ACCESS_KEY: NOT SET")
 logger.info("S3_SECRET_KEY: SET" if os.getenv('S3_SECRET_KEY') else "S3_SECRET_KEY: NOT SET")
 logger.info("==============================")
 
-# Environment variables
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Environment variables - S3 only (Supabase Storage S3 uyğunluğu)
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "music")
+REGION_NAME = os.getenv("REGION_NAME", "ap-southeast-2")
 
-# Supabase client
+# S3 client (Supabase Storage üçün)
 try:
-    logger.info("Initializing Supabase client...")
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Supabase client initialized")
+    logger.info("Initializing S3 client for Supabase Storage...")
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name=REGION_NAME,
+        config=Config(signature_version='s3v4')
+    )
+    logger.info("✅ S3 client initialized")
 except Exception as e:
-    logger.error(f"❌ Failed to initialize Supabase client: {e}")
+    logger.error(f"❌ Failed to initialize S3 client: {e}")
     logger.error(traceback.format_exc())
     raise
 
@@ -56,12 +64,16 @@ def ensure_bucket_exists():
     """Storage bucket-in mövcud olduğunu yoxla"""
     try:
         logger.info(f"Checking bucket: {BUCKET_NAME}")
-        buckets = supabase.storage.list_buckets()
-        bucket_names = [b.name for b in buckets]
+        existing_buckets = s3_client.list_buckets()
+        bucket_names = [b['Name'] for b in existing_buckets['Buckets']]
         
         if BUCKET_NAME not in bucket_names:
             logger.info(f"Creating bucket: {BUCKET_NAME}")
-            supabase.storage.create_bucket(BUCKET_NAME, {'public': True})
+            # Supabase Storage üçün bucket yaratma
+            s3_client.create_bucket(Bucket=BUCKET_NAME)
+            
+            # Bucket-i public et (opsional)
+            s3_client.put_bucket_acl(Bucket=BUCKET_NAME, ACL='public-read')
             logger.info(f"✅ Created bucket: {BUCKET_NAME}")
         else:
             logger.info(f"✅ Bucket already exists: {BUCKET_NAME}")
@@ -74,7 +86,7 @@ def ensure_bucket_exists():
 def load_model():
     """Modeli yüklə"""
     try:
-        logger.info("🚀 ACE-Step (AudioLDM2) Model yüklənir...")
+        logger.info("🚀 AudioLDM2 Model yüklənir...")
         
         repo_id = "cvssp/audioldm2-music"
         logger.info(f"Loading model from: {repo_id}")
@@ -103,7 +115,7 @@ def load_model():
         raise
 
 def save_to_supabase_storage(audio_tensor, sample_rate, filename):
-    """Audionu Supabase Storage-a yüklə"""
+    """Audionu Supabase Storage-a (S3) yüklə"""
     try:
         logger.info(f"Saving audio to Supabase Storage: {filename}")
         
@@ -115,15 +127,24 @@ def save_to_supabase_storage(audio_tensor, sample_rate, filename):
         
         logger.info(f"Audio size: {len(audio_bytes)} bytes")
         
-        # Upload to Supabase Storage
-        supabase.storage.from_(BUCKET_NAME).upload(
-            filename,
-            audio_bytes,
-            {"content-type": "audio/wav"}
+        # Upload to S3 (Supabase Storage)
+        s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=filename,
+            Body=audio_bytes,
+            ContentType='audio/wav',
+            ACL='public-read'  # Public etmək üçün
         )
         
-        # Get public URL
-        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(filename)
+        # Generate public URL
+        # Supabase Storage S3 URL formatı
+        if S3_ENDPOINT:
+            # S3 endpoint-dən istifadə edərək URL yarat
+            base_url = S3_ENDPOINT.replace('/storage/v1/s3', '')
+            public_url = f"{base_url}/storage/v1/object/public/{BUCKET_NAME}/{filename}"
+        else:
+            # Fallback URL
+            public_url = f"https://{BUCKET_NAME}.supabase.co/storage/v1/object/public/{BUCKET_NAME}/{filename}"
         
         logger.info(f"✅ Uploaded successfully: {public_url}")
         return public_url
@@ -161,7 +182,7 @@ def handler(job):
     
     try:
         job_input = job.get('input', {})
-        prompt = job_input.get("text", "Lofi hip hop beat, calm and relaxing")
+        prompt = job_input.get("prompt", job_input.get("text", "Lofi hip hop beat, calm and relaxing"))
         duration = job_input.get("duration", 10)
         
         logger.info(f"📝 Prompt: {prompt[:100]}...")
