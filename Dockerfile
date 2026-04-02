@@ -1,5 +1,5 @@
 # Dockerfile
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 # Python quraşdır
 RUN apt-get update && apt-get install -y \
