@@ -1,4 +1,4 @@
-# handler.py - S3 ilə Supabase Storage versiyası
+# handler.py - Dtype hatası düzəldilmiş versiya
 import os
 import io
 import uuid
@@ -12,6 +12,7 @@ import logging
 import sys
 import traceback
 from dotenv import load_dotenv
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -27,25 +28,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Log environment variables (without sensitive data)
-logger.info("=== ENVIRONMENT VARIABLES ===")
-logger.info(f"S3_ENDPOINT: {os.getenv('S3_ENDPOINT', 'NOT SET')}")
-logger.info(f"BUCKET_NAME: {os.getenv('BUCKET_NAME', 'NOT SET')}")
-logger.info(f"REGION_NAME: {os.getenv('REGION_NAME', 'NOT SET')}")
-logger.info("S3_ACCESS_KEY: SET" if os.getenv('S3_ACCESS_KEY') else "S3_ACCESS_KEY: NOT SET")
-logger.info("S3_SECRET_KEY: SET" if os.getenv('S3_SECRET_KEY') else "S3_SECRET_KEY: NOT SET")
-logger.info("==============================")
-
-# Environment variables - S3 only (Supabase Storage S3 uyğunluğu)
+# Environment variables
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "music")
 REGION_NAME = os.getenv("REGION_NAME", "ap-southeast-2")
 
-# S3 client (Supabase Storage üçün)
+# Log environment
+logger.info("=== ENVIRONMENT VARIABLES ===")
+logger.info(f"S3_ENDPOINT: {S3_ENDPOINT}")
+logger.info(f"BUCKET_NAME: {BUCKET_NAME}")
+logger.info(f"REGION_NAME: {REGION_NAME}")
+logger.info("S3_ACCESS_KEY: SET" if S3_ACCESS_KEY else "S3_ACCESS_KEY: NOT SET")
+logger.info("S3_SECRET_KEY: SET" if S3_SECRET_KEY else "S3_SECRET_KEY: NOT SET")
+logger.info("==============================")
+
+# Initialize S3 client
 try:
-    logger.info("Initializing S3 client for Supabase Storage...")
+    logger.info("Initializing S3 client...")
     s3_client = boto3.client(
         's3',
         endpoint_url=S3_ENDPOINT,
@@ -57,11 +58,10 @@ try:
     logger.info("✅ S3 client initialized")
 except Exception as e:
     logger.error(f"❌ Failed to initialize S3 client: {e}")
-    logger.error(traceback.format_exc())
     raise
 
 def ensure_bucket_exists():
-    """Storage bucket-in mövcud olduğunu yoxla"""
+    """Check and create bucket if needed"""
     try:
         logger.info(f"Checking bucket: {BUCKET_NAME}")
         existing_buckets = s3_client.list_buckets()
@@ -69,44 +69,52 @@ def ensure_bucket_exists():
         
         if BUCKET_NAME not in bucket_names:
             logger.info(f"Creating bucket: {BUCKET_NAME}")
-            # Supabase Storage üçün bucket yaratma
             s3_client.create_bucket(Bucket=BUCKET_NAME)
-            
-            # Bucket-i public et (opsional)
             s3_client.put_bucket_acl(Bucket=BUCKET_NAME, ACL='public-read')
             logger.info(f"✅ Created bucket: {BUCKET_NAME}")
         else:
             logger.info(f"✅ Bucket already exists: {BUCKET_NAME}")
-            
     except Exception as e:
-        logger.error(f"Error checking/creating bucket: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error with bucket: {e}")
         raise
 
 def load_model():
-    """Modeli yüklə"""
+    """Load model with proper dtype handling"""
     try:
-        logger.info("🚀 AudioLDM2 Model yüklənir...")
+        logger.info("🚀 Loading AudioLDM2 model...")
         
         repo_id = "cvssp/audioldm2-music"
-        logger.info(f"Loading model from: {repo_id}")
+        
+        # Force float32 to avoid dtype issues
+        torch_dtype = torch.float32
         
         if torch.cuda.is_available():
             logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
-            logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            # Use float16 on GPU for better performance
+            torch_dtype = torch.float16
             pipe = AudioLDM2Pipeline.from_pretrained(
                 repo_id, 
-                torch_dtype=torch.float16
+                torch_dtype=torch_dtype
             )
             pipe.to("cuda")
-            logger.info("✅ Model loaded on GPU (float16)")
+            logger.info("✅ Model loaded on GPU")
         else:
-            logger.warning("No GPU available, using CPU (this will be slow)")
-            pipe = AudioLDM2Pipeline.from_pretrained(repo_id)
+            logger.warning("No GPU available, using CPU with float32")
+            pipe = AudioLDM2Pipeline.from_pretrained(
+                repo_id,
+                torch_dtype=torch.float32
+            )
             pipe.to("cpu")
-            logger.info("✅ Model loaded on CPU (float32)")
+            logger.info("✅ Model loaded on CPU")
         
-        logger.info("✅ Model loaded successfully!")
+        # Ensure all sub-models use same dtype
+        pipe.vae = pipe.vae.to(dtype=torch_dtype)
+        pipe.unet = pipe.unet.to(dtype=torch_dtype)
+        
+        # Enable memory efficiency
+        pipe.enable_model_cpu_offload() if not torch.cuda.is_available() else None
+        
+        logger.info("✅ Model ready!")
         return pipe
         
     except Exception as e:
@@ -115,11 +123,17 @@ def load_model():
         raise
 
 def save_to_supabase_storage(audio_tensor, sample_rate, filename):
-    """Audionu Supabase Storage-a (S3) yüklə"""
+    """Upload audio to Supabase Storage"""
     try:
-        logger.info(f"Saving audio to Supabase Storage: {filename}")
+        logger.info(f"Saving audio: {filename}")
         
-        # Audio-nu WAV formatında bytes-a çevir
+        # Convert to proper dtype and range
+        audio_tensor = audio_tensor.float()  # Ensure float32
+        
+        # Normalize to [-1, 1] range if needed
+        if audio_tensor.abs().max() > 1.0:
+            audio_tensor = audio_tensor / audio_tensor.abs().max()
+        
         buffer = io.BytesIO()
         torchaudio.save(buffer, audio_tensor, sample_rate, format="wav", backend="soundfile")
         buffer.seek(0)
@@ -127,37 +141,30 @@ def save_to_supabase_storage(audio_tensor, sample_rate, filename):
         
         logger.info(f"Audio size: {len(audio_bytes)} bytes")
         
-        # Upload to S3 (Supabase Storage)
+        # Upload to S3
         s3_client.put_object(
             Bucket=BUCKET_NAME,
             Key=filename,
             Body=audio_bytes,
             ContentType='audio/wav',
-            ACL='public-read'  # Public etmək üçün
+            ACL='public-read'
         )
         
         # Generate public URL
-        # Supabase Storage S3 URL formatı
-        if S3_ENDPOINT:
-            # S3 endpoint-dən istifadə edərək URL yarat
-            base_url = S3_ENDPOINT.replace('/storage/v1/s3', '')
-            public_url = f"{base_url}/storage/v1/object/public/{BUCKET_NAME}/{filename}"
-        else:
-            # Fallback URL
-            public_url = f"https://{BUCKET_NAME}.supabase.co/storage/v1/object/public/{BUCKET_NAME}/{filename}"
+        public_url = f"https://{BUCKET_NAME}.supabase.co/storage/v1/object/public/{BUCKET_NAME}/{filename}"
         
-        logger.info(f"✅ Uploaded successfully: {public_url}")
+        logger.info(f"✅ Uploaded: {public_url}")
         return public_url
         
     except Exception as e:
-        logger.error(f"❌ Failed to upload to Supabase Storage: {e}")
+        logger.error(f"❌ Upload failed: {e}")
         logger.error(traceback.format_exc())
         raise
 
-# Initialize model and bucket
-logger.info("=" * 60)
+# Initialize
+logger.info("="*60)
 logger.info("Starting RunPod worker initialization...")
-logger.info("=" * 60)
+logger.info("="*60)
 
 try:
     logger.info("Step 1: Ensuring bucket exists...")
@@ -166,56 +173,64 @@ try:
     logger.info("Step 2: Loading model...")
     model_pipe = load_model()
     
-    logger.info("✅ All initialization completed successfully!")
+    logger.info("✅ Initialization complete!")
     
 except Exception as e:
     logger.error(f"❌ Initialization failed: {e}")
-    logger.error(traceback.format_exc())
     raise
 
 def handler(job):
-    """RunPod handler function"""
+    """RunPod handler"""
     job_id = job.get('id', 'unknown')
-    logger.info(f"=" * 60)
-    logger.info(f"Received job: {job_id}")
-    logger.info(f"=" * 60)
+    logger.info(f"="*60)
+    logger.info(f"Processing job: {job_id}")
+    logger.info(f"="*60)
     
     try:
         job_input = job.get('input', {})
         prompt = job_input.get("prompt", job_input.get("text", "Lofi hip hop beat, calm and relaxing"))
-        duration = job_input.get("duration", 10)
+        duration = min(job_input.get("duration", 10), 30)  # Max 30 seconds
         
-        logger.info(f"📝 Prompt: {prompt[:100]}...")
-        logger.info(f"⏱️ Duration: {duration} seconds")
+        logger.info(f"📝 Prompt: {prompt[:100]}")
+        logger.info(f"⏱️ Duration: {duration}s")
         
         # Generate music
         logger.info("🎵 Generating music...")
         
         with torch.inference_mode():
-            logger.info("Running model inference...")
-            audio_output = model_pipe(
-                prompt, 
-                audio_length_in_s=duration, 
-                num_inference_steps=50,
-                guidance_scale=7.5
-            ).audios[0]
+            # Ensure inputs are correct dtype
+            result = model_pipe(
+                prompt,
+                audio_length_in_s=duration,
+                num_inference_steps=30,  # Reduced for speed
+                guidance_scale=7.5,
+                generator=torch.Generator().manual_seed(42)  # Consistent results
+            )
+            
+            audio_output = result.audios[0]
+            
+            # Convert to tensor with proper dtype
+            if isinstance(audio_output, np.ndarray):
+                audio_tensor = torch.from_numpy(audio_output).float()
+            else:
+                audio_tensor = audio_output.float() if torch.is_tensor(audio_output) else torch.from_numpy(audio_output).float()
+            
+            # Ensure correct shape [channels, samples]
+            if audio_tensor.dim() == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)  # Add channel dimension
+            elif audio_tensor.dim() == 2 and audio_tensor.shape[0] > 2:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            
+            logger.info(f"Audio shape: {audio_tensor.shape}, dtype: {audio_tensor.dtype}")
         
-        logger.info(f"Audio generated, shape: {audio_output.shape}")
-        
-        # Convert to tensor
-        audio_tensor = torch.from_numpy(audio_output).unsqueeze(0)
         sample_rate = 16000
         
-        logger.info(f"Audio tensor shape: {audio_tensor.shape}, sample rate: {sample_rate}")
-        
         # Create filename
-        file_name = f"ace_{uuid.uuid4()}.wav"
-        logger.info(f"Generated filename: {file_name}")
+        file_name = f"music_{uuid.uuid4().hex[:8]}.wav"
         
-        # Upload to Supabase Storage
+        # Upload
         public_url = save_to_supabase_storage(audio_tensor, sample_rate, file_name)
         
-        # Response
         result = {
             "status": "success",
             "url": public_url,
@@ -225,21 +240,20 @@ def handler(job):
             "sample_rate": sample_rate
         }
         
-        logger.info(f"✅ Job completed successfully: {job_id}")
+        logger.info(f"✅ Job completed: {job_id}")
         logger.info(f"🔊 Audio URL: {public_url}")
         
         return result
         
     except Exception as e:
-        logger.error(f"❌ Error in handler for job {job_id}: {e}")
+        logger.error(f"❌ Error in job {job_id}: {e}")
         logger.error(traceback.format_exc())
         return {
             "status": "error",
-            "message": f"Xəta: {str(e)}",
+            "message": str(e),
             "error_type": type(e).__name__
         }
 
-# RunPod serverless start
 if __name__ == "__main__":
     logger.info("Starting RunPod serverless handler...")
     runpod.serverless.start({"handler": handler})
