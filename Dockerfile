@@ -1,4 +1,3 @@
-# Dockerfile - CUDA 11.8.0 ilə (Stabil)
 FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y \
@@ -14,9 +13,14 @@ RUN update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
 WORKDIR /app
 
-# CUDA 11.8 üçün xüsusi PyTorch
-RUN pip install --no-cache-dir torch==2.0.1 torchaudio==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+# Öncə pip-i yenilə
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
+# CUDA 11.8 üçün PyTorch (ayrıca)
+RUN pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.1+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# Qalan dependency-lər
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
