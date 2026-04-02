@@ -1,4 +1,3 @@
-# requirements.txt - S3 versiyası
 torch>=2.0.0
 torchaudio>=2.0.0
 diffusers>=0.24.0
